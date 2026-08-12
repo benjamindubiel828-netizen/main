@@ -1,0 +1,5 @@
+.env
+attendance.sqlite3
+attendance.sqlite3-shm
+attendance.sqlite3-wal
+__pycache__/
