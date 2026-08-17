@@ -1,2 +1,7 @@
+<<<<<<< HEAD
 discord.py>=2.0.0
 python-dotenv
+=======
+discord.py
+python-dotenv
+>>>>>>> cefd4a0e58f67f4705c2aa2ffaaa6475a91e5737
