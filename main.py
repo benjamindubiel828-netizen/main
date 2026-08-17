@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 """Event attendance and leadership-roll Discord bot.
 
 Set DISCORD_TOKEN in .env, invite the bot with the Message Content intent,
@@ -15,20 +15,19 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
-=======
+
 """BakeBot: randomly assign an Officer and Sergeant for a Discord event."""
 
 import logging
 import os
 import random
->>>>>>> cefd4a0e58f67f4705c2aa2ffaaa6475a91e5737
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
 
-<<<<<<< HEAD
+
 OFFICER_ROLE = "Officers"
 NCO_ROLE = "Non-Commission Officer"
 ENLISTED_ROLE = "Enlisted"
@@ -727,7 +726,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-=======
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -898,4 +896,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN is missing. Add it to your .env file.")
     bot.run(TOKEN, log_handler=handler, log_level=logging.INFO)
->>>>>>> cefd4a0e58f67f4705c2aa2ffaaa6475a91e5737
+
