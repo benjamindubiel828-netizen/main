@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 """BakeBot: randomly assign an Officer and Sergeant for a Discord event."""
 
@@ -35,6 +36,8 @@ NCO_ROLE_ALIASES = (NCO_ROLE, "Non-Commissioned Officers")
 ENLISTED_ROLE = "Enlisted"
 ATTENDANCE_ROLE = "Attendance"
 ACTIVE_DUTY_ROLE = "Active Duty"
+DEFAULT_EVENT_CHANNEL = "❗events"
+EVENT_TIMEZONE = "America/New_York"
 DATABASE_PATH = Path(__file__).with_name("attendance.sqlite3")
 active_event_wizards: set[int] = set()
 
@@ -137,6 +140,13 @@ class AttendanceDatabase:
         )
         self.connection.commit()
         return cursor.rowcount == 1
+
+    def remove_event_attendee(self, event_id: int, user_id: int) -> None:
+        self.connection.execute(
+            "DELETE FROM event_attendees WHERE event_id = ? AND user_id = ?",
+            (event_id, user_id),
+        )
+        self.connection.commit()
 
     def add_admin_panel(self, guild_id: int, channel_id: int, message_id: int) -> None:
         self.connection.execute(
@@ -290,9 +300,13 @@ def leaderboard_content(guild: discord.Guild) -> str:
     """Create a public standings board using Discord's native Markdown sizes."""
     lines = ["# Event Attendance Leaderboard", ""]
     medals = ("🥇", "🥈", "🥉")
-    for position, (user_id, total) in enumerate(db.attendance_rows(guild.id), start=1):
-        member = guild.get_member(user_id)
-        name = member.display_name if member else f"Former member ({user_id})"
+    current_members = [
+        (member, total)
+        for user_id, total in db.attendance_rows(guild.id)
+        if (member := guild.get_member(user_id)) is not None
+    ]
+    for position, (member, total) in enumerate(current_members, start=1):
+        name = member.display_name
         if position <= 3:
             lines.append(f"## {medals[position - 1]} {name} — **{total}**")
         else:
@@ -344,6 +358,40 @@ async def refresh_leaderboards(guild: discord.Guild) -> None:
 async def refresh_attendance_displays(guild: discord.Guild) -> None:
     await refresh_administration_panels(guild)
     await refresh_leaderboards(guild)
+
+
+async def post_event_completion_confirmation(
+    guild: discord.Guild,
+    event_name: str,
+    event_details: str,
+    attendees: list[Attendee],
+) -> None:
+    """Post an event and leaderboard-update receipt in #bakebot-center."""
+    channel = discord.utils.get(guild.text_channels, name="bakebot-center")
+    if channel is None:
+        log.warning("Could not post event completion confirmation: #bakebot-center was not found")
+        return
+
+    credited = [
+        f"{person.mention} — now **{db.attendance_count(guild.id, person.user_id)}** event(s)"
+        for person in attendees
+    ]
+    credited_text = "\n".join(credited) or "*No attendees were credited.*"
+    if len(credited_text) > 1_024:
+        credited_text = credited_text[:980].rsplit("\n", 1)[0] + "\n*…additional attendees not shown*"
+
+    embed = discord.Embed(
+        title="Leaderboard updated",
+        description=event_details[:3_600],
+        colour=discord.Colour.green(),
+    )
+    embed.add_field(name="Event", value=event_name[:1_024], inline=False)
+    embed.add_field(name=f"Credited attendees ({len(attendees)})", value=credited_text, inline=False)
+    embed.set_footer(text="Attendance totals and the leaderboard have been updated.")
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception("Could not post event completion confirmation in #bakebot-center")
 
 
 async def remove_command_message(ctx: commands.Context) -> None:
@@ -483,11 +531,14 @@ class LeaderboardChannelView(discord.ui.View):
         await interaction.response.edit_message(content=f"Leaderboard posted in {self.channel.mention}.", view=None)
 
 
-class AdminSayChannelSelect(discord.ui.ChannelSelect):
+class AdminSayChannelSelect(discord.ui.Select):
     def __init__(self, owner: "AdminSayChannelView") -> None:
         super().__init__(
             placeholder="Choose a channel to post the message…",
-            channel_types=[discord.ChannelType.text],
+            options=[
+                discord.SelectOption(label=f"#{channel.name}", value=str(channel.id))
+                for channel in owner.guild.text_channels[:25]
+            ],
             min_values=1,
             max_values=1,
         )
@@ -497,10 +548,7 @@ class AdminSayChannelSelect(discord.ui.ChannelSelect):
         if interaction.user.id != self.owner.author_id:
             await interaction.response.send_message("Only the person who used !adminsay can choose the channel.", ephemeral=True)
             return
-        if interaction.guild is None:
-            await interaction.response.send_message("Choose a server text channel.", ephemeral=True)
-            return
-        channel = interaction.guild.get_channel(self.values[0].id)
+        channel = self.owner.guild.get_channel(int(self.values[0]))
         if not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message("Choose a server text channel.", ephemeral=True)
             return
@@ -513,11 +561,12 @@ class AdminSayChannelSelect(discord.ui.ChannelSelect):
 
 
 class AdminSayChannelView(discord.ui.View):
-    def __init__(self, author_id: int, message_text: str, dm_prompt: discord.Message) -> None:
+    def __init__(self, author_id: int, message_text: str, dm_prompt: discord.Message, guild: discord.Guild) -> None:
         super().__init__(timeout=120)
         self.author_id = author_id
         self.message_text = message_text
         self.dm_prompt = dm_prompt
+        self.guild = guild
         self.channel: discord.TextChannel | None = None
         self.add_item(AdminSayChannelSelect(self))
 
@@ -526,10 +575,10 @@ class AdminSayChannelView(discord.ui.View):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("Only the person who used !adminsay can post the message.", ephemeral=True)
             return
-        if self.channel is None or interaction.guild is None:
+        if self.channel is None:
             await interaction.response.send_message("Choose a channel first.", ephemeral=True)
             return
-        me = interaction.guild.me
+        me = self.guild.me
         if me is None or not self.channel.permissions_for(me).send_messages:
             await interaction.response.send_message("I cannot post in that channel. Check my channel permissions.", ephemeral=True)
             return
@@ -620,6 +669,7 @@ class RollItView(discord.ui.View):
             self.completed = True
             await interaction.response.send_message("Attendance was already recorded for this event.", ephemeral=True)
             return
+        await interaction.response.defer()
         self.completed = True
         button.disabled = True
         removed_roles = 0
@@ -640,17 +690,20 @@ class RollItView(discord.ui.View):
                         removed_roles += 1
                     except (discord.Forbidden, discord.HTTPException):
                         log.exception("Could not remove Attendance from %s after event %s", attendee.user_id, self.event_id)
-        embed = interaction.message.embeds[0] if interaction.message and interaction.message.embeds else roster_embed(self.roster)
-        embed = embed.copy()
-        embed.set_footer(text=f"Attendance recorded for {len(self.roster)} member(s); @Attendance removed from {removed_roles}")
-        await interaction.response.edit_message(embed=embed, view=self)
-        if interaction.message:
-            try:
-                await interaction.message.delete()
-            except (discord.Forbidden, discord.HTTPException):
-                log.exception("Could not remove completed event post %s", interaction.message.id)
+        try:
+            await interaction.delete_original_response()
+        except (discord.Forbidden, discord.HTTPException):
+            message_id = interaction.message.id if interaction.message else "unknown"
+            log.exception("Could not remove completed event post %s", message_id)
         if interaction.guild:
             await refresh_attendance_displays(interaction.guild)
+            source = interaction.channel.mention if interaction.channel else "Unknown channel"
+            await post_event_completion_confirmation(
+                interaction.guild,
+                "Event Attendance",
+                f"Started by <@{self.invoker_id}> in {source}.\nEvent ID: `{self.event_id}`",
+                self.roster,
+            )
 
     @discord.ui.button(label="Late attendance", style=discord.ButtonStyle.secondary, emoji="⏱️", custom_id="bakebot:late-attendance")
     async def late_attendance(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -696,8 +749,8 @@ def event_embed(event: "ScheduledEventView") -> discord.Embed:
     accepted = "\n".join(member.mention for member in event.accepted.values()) or "No accepted attendees yet"
     tentative = "\n".join(member.mention for member in event.tentative.values()) or "No tentative attendees yet"
     embed = discord.Embed(title=event.title, description=event.description, colour=discord.Colour.gold())
-    time_label = event.starts_at.strftime("%A, %B %d, %Y at %I:%M %p").replace(" 0", " ")
-    embed.add_field(name="Time", value=time_label, inline=False)
+    # Discord converts this timestamp into the local time zone of every viewer.
+    embed.add_field(name="Time", value=f"<t:{int(event.starts_at.timestamp())}:F>", inline=False)
     embed.add_field(name=f"✅ Accepted ({len(event.accepted)})", value=accepted, inline=True)
     embed.add_field(name=f"❓ Tentative ({len(event.tentative)})", value=tentative, inline=True)
     if event.last_sergeants:
@@ -706,6 +759,8 @@ def event_embed(event: "ScheduledEventView") -> discord.Embed:
             value="\n".join(member.mention for member in event.last_sergeants),
             inline=False,
         )
+    if event.last_officer:
+        embed.add_field(name="Next-round Officer", value=event.last_officer.mention, inline=False)
     embed.set_footer(text=f"Created by {event.organizer.display_name}")
     return embed
 
@@ -720,9 +775,9 @@ class ManualEventMemberSelect(discord.ui.UserSelect):
         if not isinstance(member, discord.Member):
             await interaction.response.send_message("I could not resolve that server member.", ephemeral=True)
             return
-        if await self.event.add_accepted(member, interaction):
+        if await self.event.add_accepted(member):
             await interaction.response.edit_message(
-                content=f"Added {member.mention} as accepted and assigned @Attendance.", view=None
+                content=f"Added {member.mention} as accepted.", view=None
             )
 
 
@@ -730,6 +785,36 @@ class ManualEventMemberView(discord.ui.View):
     def __init__(self, event: "ScheduledEventView") -> None:
         super().__init__(timeout=120)
         self.add_item(ManualEventMemberSelect(event))
+
+
+class EventNoShowSelect(discord.ui.Select):
+    def __init__(self, event: "ScheduledEventView") -> None:
+        super().__init__(
+            placeholder="Select an Accepted attendee to remove…",
+            options=[
+                discord.SelectOption(label=member.display_name[:100], value=str(member.id))
+                for member in list(event.accepted.values())[:25]
+            ],
+            min_values=1,
+            max_values=1,
+        )
+        self.event = event
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        member = self.event.accepted.get(int(self.values[0]))
+        if member is None:
+            await interaction.response.send_message("That member is not currently marked Accepted for this event.", ephemeral=True)
+            return
+        await self.event.remove_accepted(member)
+        await interaction.response.edit_message(
+            content=f"Removed {member.mention} from Accepted.", view=None
+        )
+
+
+class EventNoShowView(discord.ui.View):
+    def __init__(self, event: "ScheduledEventView") -> None:
+        super().__init__(timeout=120)
+        self.add_item(EventNoShowSelect(event))
 
 
 class ScheduledEventView(discord.ui.View):
@@ -751,22 +836,13 @@ class ScheduledEventView(discord.ui.View):
         self.event_id: int | None = None
         self.finished = False
         self.last_sergeants: list[discord.Member] = []
+        self.last_officer: discord.Member | None = None
 
     async def refresh_post(self) -> None:
         if self.message:
             await self.message.edit(embed=event_embed(self), view=self)
 
-    async def add_accepted(self, member: discord.Member, interaction: discord.Interaction) -> bool:
-        role = discord.utils.get(member.guild.roles, name=ATTENDANCE_ROLE)
-        if role is None:
-            await interaction.response.send_message("I cannot find the @Attendance role.", ephemeral=True)
-            return False
-        if role not in member.roles:
-            try:
-                await member.add_roles(role, reason=f"Accepted RSVP: {self.title}")
-            except discord.Forbidden:
-                await interaction.response.send_message("I need Manage Roles permission and a role position above @Attendance.", ephemeral=True)
-                return False
+    async def add_accepted(self, member: discord.Member) -> bool:
         self.accepted[member.id] = member
         self.tentative.pop(member.id, None)
         if self.event_id is not None:
@@ -776,21 +852,45 @@ class ScheduledEventView(discord.ui.View):
         await self.refresh_post()
         return True
 
+    async def remove_accepted(self, member: discord.Member) -> None:
+        """Remove a no-show from the event before attendance is finalized."""
+        self.accepted.pop(member.id, None)
+        if self.event_id is not None:
+            db.remove_event_attendee(self.event_id, member.id)
+        await self.refresh_post()
+
     @discord.ui.button(label="Accepted", style=discord.ButtonStyle.success, emoji="✅")
     async def accepted_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("You must be a server member to sign up.", ephemeral=True)
             return
-        if await self.add_accepted(interaction.user, interaction):
-            await interaction.response.send_message("You are marked as accepted and have @Attendance.", ephemeral=True)
+        if interaction.user.id in self.accepted:
+            await self.remove_accepted(interaction.user)
+            await interaction.response.send_message(
+                "Your Accepted RSVP was removed, so you will not receive attendance credit for this event.",
+                ephemeral=True,
+            )
+            return
+        if await self.add_accepted(interaction.user):
+            await interaction.response.send_message(
+                "You are marked as accepted and will receive credit when an officer ends the event.",
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="Tentative", style=discord.ButtonStyle.secondary, emoji="❓")
     async def tentative_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("You must be a server member to sign up.", ephemeral=True)
             return
+        if interaction.user.id in self.tentative:
+            self.tentative.pop(interaction.user.id, None)
+            await self.refresh_post()
+            await interaction.response.send_message("Your Tentative RSVP was removed.", ephemeral=True)
+            return
         self.tentative[interaction.user.id] = interaction.user
         self.accepted.pop(interaction.user.id, None)
+        if self.event_id is not None:
+            db.remove_event_attendee(self.event_id, interaction.user.id)
         await self.refresh_post()
         await interaction.response.send_message("You are marked as tentative.", ephemeral=True)
 
@@ -801,6 +901,16 @@ class ScheduledEventView(discord.ui.View):
             await interaction.response.send_message("Only members with @Officers can add members.", ephemeral=True)
             return
         await interaction.response.send_message("Select a member to add.", view=ManualEventMemberView(self), ephemeral=True)
+
+    @discord.ui.button(label="Remove no-show", style=discord.ButtonStyle.danger, emoji="➖")
+    async def remove_no_show_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not isinstance(interaction.user, discord.Member) or OFFICER_ROLE.casefold() not in role_names(interaction.user):
+            await interaction.response.send_message("Only members with @Officers can remove a no-show.", ephemeral=True)
+            return
+        if not self.accepted:
+            await interaction.response.send_message("There are no Accepted attendees to remove.", ephemeral=True)
+            return
+        await interaction.response.send_message("Select the Accepted attendee who did not show up.", view=EventNoShowView(self), ephemeral=True)
 
     @discord.ui.button(label="Roll Sgt", style=discord.ButtonStyle.secondary, emoji="🎲")
     async def roll_sergeants(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -824,6 +934,24 @@ class ScheduledEventView(discord.ui.View):
         self.last_sergeants = random.sample(eligible, 2)
         await interaction.response.edit_message(embed=event_embed(self), view=self)
 
+    @discord.ui.button(label="Roll Officer", style=discord.ButtonStyle.secondary, emoji="🎲")
+    async def roll_officer(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not isinstance(interaction.user, discord.Member) or OFFICER_ROLE.casefold() not in role_names(interaction.user):
+            await interaction.response.send_message("Only members with @Officers can roll the Officer.", ephemeral=True)
+            return
+        eligible = [
+            member
+            for member in self.accepted.values()
+            if not member.bot and OFFICER_ROLE.casefold() in role_names(member)
+        ]
+        if not eligible:
+            await interaction.response.send_message(
+                "At least one Accepted member with @Officers is needed to roll an Officer.", ephemeral=True
+            )
+            return
+        self.last_officer = random.choice(eligible)
+        await interaction.response.edit_message(embed=event_embed(self), view=self)
+
     @discord.ui.button(label="END EVENT", style=discord.ButtonStyle.danger, emoji="🛑")
     async def end_event_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if not isinstance(interaction.user, discord.Member) or OFFICER_ROLE.casefold() not in role_names(interaction.user):
@@ -839,20 +967,41 @@ class ScheduledEventView(discord.ui.View):
         if not db.complete_event(self.event_id, interaction.guild.id, attendees):
             await interaction.response.send_message("This event has already been submitted.", ephemeral=True)
             return
+        await interaction.response.defer()
         self.finished = True
-        role = discord.utils.get(interaction.guild.roles, name=ATTENDANCE_ROLE)
-        if role:
-            for member in interaction.guild.members:
-                if role in member.roles:
-                    try:
-                        await member.remove_roles(role, reason=f"Event ended: {self.title}")
-                    except (discord.Forbidden, discord.HTTPException):
-                        log.exception("Could not remove Attendance from %s", member.id)
+        try:
+            await interaction.delete_original_response()
+        except (discord.Forbidden, discord.HTTPException):
+            message_id = interaction.message.id if interaction.message else "unknown"
+            log.exception("Could not remove completed event post %s", message_id)
         await refresh_attendance_displays(interaction.guild)
-        await interaction.response.edit_message(content="Event ended and attendance submitted.", embed=None, view=None)
+        source = interaction.channel.mention if interaction.channel else "Unknown channel"
+        await post_event_completion_confirmation(
+            interaction.guild,
+            self.title,
+            (
+                f"**Scheduled:** <t:{int(self.starts_at.timestamp())}:F>\n"
+                f"**Organizer:** {self.organizer.mention}\n"
+                f"**Posted in:** {source}\n\n{self.description}"
+            ),
+            attendees,
+        )
 
 
-def parse_event_time(day: str, text: str) -> datetime | None:
+def event_timezone_from_input(value: str) -> ZoneInfo | None:
+    aliases = {
+        "ET": "America/New_York", "EST": "America/New_York", "EDT": "America/New_York",
+        "CT": "America/Chicago", "CST": "America/Chicago", "CDT": "America/Chicago",
+        "MT": "America/Denver", "MST": "America/Denver", "MDT": "America/Denver",
+        "PT": "America/Los_Angeles", "PST": "America/Los_Angeles", "PDT": "America/Los_Angeles",
+    }
+    try:
+        return ZoneInfo(aliases.get(value.strip().upper(), value.strip()))
+    except Exception:
+        return None
+
+
+def parse_event_time(day: str, text: str, event_timezone: ZoneInfo) -> datetime | None:
     formats = ("%I:%M %p", "%I %p", "%H:%M", "%H")
     parsed = None
     for fmt in formats:
@@ -863,8 +1012,8 @@ def parse_event_time(day: str, text: str) -> datetime | None:
             continue
     if parsed is None:
         return None
-    target_date = datetime.now().date() + timedelta(days=1 if day == "tomorrow" else 0)
-    return datetime.combine(target_date, parsed)
+    target_date = datetime.now(event_timezone).date() + timedelta(days=1 if day == "tomorrow" else 0)
+    return datetime.combine(target_date, parsed, tzinfo=event_timezone)
 
 
 intents = discord.Intents.default()
@@ -884,6 +1033,14 @@ async def setup_hook() -> None:
 @bot.event
 async def on_ready() -> None:
     log.info("Connected as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
+    for guild in bot.guilds:
+        await refresh_leaderboards(guild)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member) -> None:
+    """Remove departed members from every saved leaderboard immediately."""
+    await refresh_leaderboards(member.guild)
 
 
 async def ask_event_question(user: discord.Member, question: str) -> str | None:
@@ -900,6 +1057,26 @@ async def ask_event_question(user: discord.Member, question: str) -> str | None:
     return reply.content.strip()
 
 
+def resolve_event_channel(guild: discord.Guild, value: str) -> discord.TextChannel | None:
+    """Resolve a DM reply containing a channel mention, ID, or exact name."""
+    channel_text = value.strip()
+    channel_id_text = channel_text
+    if channel_text.startswith("<#") and channel_text.endswith(">"):
+        channel_id_text = channel_text[2:-1]
+    elif channel_text.startswith("#"):
+        channel_id_text = channel_text[1:]
+
+    if channel_id_text.isdigit():
+        channel = guild.get_channel(int(channel_id_text))
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    channel_name = channel_text.removeprefix("#").casefold()
+    return discord.utils.find(
+        lambda candidate: candidate.name.casefold() == channel_name,
+        guild.text_channels,
+    )
+
+
 @bot.command(name="event")
 @commands.guild_only()
 async def create_event(ctx: commands.Context) -> None:
@@ -914,27 +1091,72 @@ async def create_event(ctx: commands.Context) -> None:
             await ctx.author.send("Let's create an event. Reply to each question in this DM.")
         except discord.Forbidden:
             return
-        day = (await ask_event_question(ctx.author, "1/5: Is the event for **today** or **tomorrow**?"))
+        day = (await ask_event_question(ctx.author, "1/7: Is the event for **today** or **tomorrow**?"))
         if day is None:
             return
         day = day.casefold()
         if day not in {"today", "tomorrow"}:
             await ctx.author.send("Please run `!event` again and answer `today` or `tomorrow`.")
             return
-        time_text = await ask_event_question(ctx.author, "2/5: What time is the event? (Example: `8:00 PM`)")
+        time_text = await ask_event_question(ctx.author, "2/7: What time is the event in your local time? (Example: `8:00 PM`)")
         if time_text is None:
             return
-        starts_at = parse_event_time(day, time_text)
+        timezone_text = await ask_event_question(
+            ctx.author,
+            "3/7: What is your timezone? Use a name like `America/New_York` or an abbreviation such as `ET`, `CT`, `MT`, or `PT`.",
+        )
+        if timezone_text is None:
+            return
+        event_timezone = event_timezone_from_input(timezone_text)
+        if event_timezone is None:
+            await ctx.author.send("I could not read that timezone. Run `!event` again with a timezone like `America/New_York` or `ET`.")
+            return
+        starts_at = parse_event_time(day, time_text, event_timezone)
         if starts_at is None:
             await ctx.author.send("I could not read that time. Run `!event` again using a time like `8:00 PM`.")
             return
-        title = await ask_event_question(ctx.author, "3/5: What is the title of the event?")
+        title = await ask_event_question(ctx.author, "4/7: What is the title of the event?")
         if not title:
             return
-        description = await ask_event_question(ctx.author, "4/5: What description should appear under the title?")
+        description = await ask_event_question(ctx.author, "5/7: What description should appear under the title?")
         if description is None:
             return
-        ping_answer = await ask_event_question(ctx.author, "5/5: Ping @Active Duty? Reply **yes** or **no**.")
+        channel_answer = await ask_event_question(
+            ctx.author,
+            f"6/7: Should the event be posted in the default **#{DEFAULT_EVENT_CHANNEL}** channel? "
+            "Reply **yes**, or specify another channel by mention, exact name, or channel ID.",
+        )
+        if channel_answer is None:
+            return
+        if channel_answer.casefold() in {"yes", "y"}:
+            destination = discord.utils.get(ctx.guild.text_channels, name=DEFAULT_EVENT_CHANNEL)
+        else:
+            if channel_answer.casefold() in {"no", "n"}:
+                channel_answer = await ask_event_question(
+                    ctx.author,
+                    "6/7 continued: Which server channel should be used instead? Reply with its mention, "
+                    "exact name, or channel ID.",
+                )
+                if channel_answer is None:
+                    return
+            destination = resolve_event_channel(ctx.guild, channel_answer)
+        if destination is None:
+            await ctx.author.send(
+                "I could not find that server text channel. Run `!event` again and specify a valid destination channel."
+            )
+            return
+        bot_member = ctx.guild.me
+        destination_permissions = destination.permissions_for(bot_member) if bot_member else None
+        if destination_permissions is None or not (
+            destination_permissions.view_channel
+            and destination_permissions.send_messages
+            and destination_permissions.embed_links
+        ):
+            await ctx.author.send(
+                f"I cannot post an embedded event in {destination.mention}. Check my channel permissions and try again."
+            )
+            return
+        ping_answer = await ask_event_question(ctx.author, "7/7: Ping @Active Duty? Reply **yes** or **no**.")
         if ping_answer is None:
             return
         should_ping = ping_answer.casefold() in {"yes", "y"}
@@ -945,15 +1167,15 @@ async def create_event(ctx: commands.Context) -> None:
             active_duty = discord.utils.get(ctx.guild.roles, name=ACTIVE_DUTY_ROLE)
             if active_duty:
                 content = active_duty.mention
-        post = await ctx.channel.send(
+        post = await destination.send(
             content=content,
             embed=event_embed(view),
             view=view,
             allowed_mentions=discord.AllowedMentions(roles=should_ping),
         )
         view.message = post
-        view.event_id = db.create_event(ctx.guild.id, ctx.channel.id, post.id, ctx.author.id, [])
-        await ctx.author.send(f"Your event, **{title}**, was posted in #{ctx.channel.name}.")
+        view.event_id = db.create_event(ctx.guild.id, destination.id, post.id, ctx.author.id, [])
+        await ctx.author.send(f"Your event, **{title}**, was posted in {destination.mention}.")
     finally:
         active_event_wizards.discard(ctx.author.id)
 
@@ -1047,11 +1269,72 @@ async def adminsay_primary(ctx: commands.Context) -> None:
         await prompt.edit(content="Timed out — no message was posted.")
         return
 
-    await ctx.channel.send(
+    await ctx.author.send(
         "Choose the channel where the prepared admin message should be posted.",
-        view=AdminSayChannelView(ctx.author.id, response.content, prompt),
-        delete_after=120,
+        view=AdminSayChannelView(ctx.author.id, response.content, prompt, ctx.guild),
     )
+
+
+@bot.command(name="help")
+@commands.guild_only()
+async def bakebot_help(ctx: commands.Context) -> None:
+    """Show BakeBot's feature guide, exclusively in #bakebot-center."""
+    await remove_command_message(ctx)
+    if not isinstance(ctx.channel, discord.TextChannel) or ctx.channel.name.casefold() != "bakebot-center":
+        return
+
+    embed = discord.Embed(
+        title="BakeBot Help",
+        description=(
+            "BakeBot manages event RSVPs, attendance, leadership rolls, and the attendance leaderboard. "
+            "Commands are removed after they are received to keep channels tidy."
+        ),
+        colour=discord.Colour.blurple(),
+    )
+    embed.add_field(
+        name="Event commands",
+        value=(
+            "`!event` — Create a scheduled RSVP event privately and choose its destination channel.\n"
+            "`!ROLLIT` — Post the current Attendance roster and open leadership rolling.\n"
+            "`!status` — Receive your attendance total and leadership eligibility by DM."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Management and information",
+        value=(
+            "`!adminpanel` — Post the interactive attendance editor in this channel.\n"
+            "`!leaderboard` — Create an automatically updating attendance leaderboard.\n"
+            "`!adminsay` — Prepare a message privately and choose a channel where BakeBot will post it.\n"
+            "`!help` — Show this guide. This command only works in `#bakebot-center`."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Scheduled event controls",
+        value=(
+            "Members can choose **Accepted** or **Tentative**; clicking the same choice again removes their RSVP. "
+            "Officers can add attendees, remove no-shows, "
+            "roll Sergeants or an Officer, and use **END EVENT** to finalize attendance. Ending an event "
+            "credits only its Accepted roster, updates the leaderboard, deletes the event post, and posts a receipt here."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Attendance roll controls",
+        value=(
+            "Checked-in members can use **Roll the Dice** to select one Officer and two unique Sergeants. "
+            "**Late attendance** adds an eligible member before completion. Officers use **END EVENT** to finalize it."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Coming soon",
+        value="No unreleased features are currently announced. Future commands and features will be documented here.",
+        inline=False,
+    )
+    embed.set_footer(text="Required role names: Officers, Non-Commission Officer, Enlisted, and Attendance")
+    await ctx.send(embed=embed)
 
 
 def main() -> None:
